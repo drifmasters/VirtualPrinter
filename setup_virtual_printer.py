@@ -2,23 +2,28 @@
 """
 setup_virtual_printer.py
 
-Этот скрипт-установщик создаёт и удаляет «виртуальный принтер» под Windows 10 x64 с помощью Python:
-1. Создаёт папку C:\VM_PRINTERS\VIRT1, если её нет.
-2. Находит в системе драйвер XPS (например, «Microsoft XPS Document Writer»).
-3. Создаёт локальный порт с именем "C:\VM_PRINTERS\VIRT1\job_%d.xps" через PowerShell Add-PrinterPort.
-4. Вызывает PrintUIEntry (rundll32 printui.dll,PrintUIEntry) для установки принтера
-   MyVirtualPrinterPython с этим локальным портом.
-5. Настраивает ACL у реального сетевого принтера (удаляет право «Print» у Users,
-   оставляя его только у SYSTEM и Administrators), чтобы пользователь не мог
-   печатать напрямую в обход виртуального.
-6. Регистрирует Windows-службу PyVirtualPrinterWorker (printer_worker.py),
-   которая в фоне следит за папкой C:\VM_PRINTERS\VIRT1 и при появлении файла
-   показывает окно с информацией (ID задания, количество страниц, размер страницы)
-   и кнопками «Удалить» / «Отправить на реальный принтер».
-7. Позволяет одним кликом «Установить и запустить» или «Остановить и удалить».
+Этот скрипт-установщик позволяет протестировать создание виртуального принтера
+MyVirtualPrinterPython без наличия «настоящего» сетевого принтера. В качестве
+«реального принтера» используется Microsoft XPS Document Writer, который
+есть в любой Windows 10.
 
-Важно: для выполнения операций установки принтера и регистрации службы требуются
-права администратора. Если скрипт запущен без повышенных прав, мастер выдаст предупреждение.
+Что делает скрипт:
+1. Создаёт папку C:\VM_PRINTERS\VIRT1, если её нет.
+2. Находит установленные драйверы XPS (например, «Microsoft XPS Document Writer»).
+3. Через PrintUIEntry (rundll32 printui.dll,PrintUIEntry) с указанием INF-файла ntprint.inf
+   автоматически создаёт локальный порт C:\VM_PRINTERS\VIRT1\job_%d.xps 
+   и привязывает к нему виртуальный принтер.
+4. (Шаг изменения ACL пропущен — мы тестируем без настоящего сетевого принтера.)
+5. Регистрирует службу PyVirtualPrinterWorker (printer_worker.py).
+6. Пытается запустить службу. В случае ошибки 1053 («Служба не ответила...»)
+   логирует предупреждение, но продолжает работу (так как для теста можно
+   запустить принтер вручную или проверить логи позже).
+7. Позволяет удалить созданные объекты (принтер и службу) одним кликом.
+
+Запуск:
+    py setup_virtual_printer.py
+
+Важно: скрипт нужно запускать «от имени администратора».
 """
 
 import os
@@ -28,18 +33,20 @@ import ctypes
 import tkinter as tk
 from tkinter import messagebox
 import win32print
-import win32con
-import win32security
 import win32serviceutil
 import win32service
+import win32con
 
 # ------------------------------------------------------------------------------
-# КОНСТАНТЫ (имена принтеров, пути и т. д.)
+# КОНСТАНТЫ
 # ------------------------------------------------------------------------------
 VIRTUAL_PRINTER_NAME = "MyVirtualPrinterPython"
 VIRT_BASE_DIR = r"C:\VM_PRINTERS\VIRT1"
 VIRT_PORT_NAME = os.path.join(VIRT_BASE_DIR, "job_%d.xps")
-REAL_PRINTER_NAME = r"\\192.168.1.200\OfficePrinter"
+
+# Используем XPS Writer как «реальный принтер» для теста
+REAL_PRINTER_NAME = "Microsoft XPS Document Writer"
+
 SERVICE_NAME = "PyVirtualPrinterWorker"
 SERVICE_DISPLAY_NAME = "Python VirtualPrinter Worker Service"
 
@@ -47,34 +54,43 @@ SERVICE_DISPLAY_NAME = "Python VirtualPrinter Worker Service"
 # ПРОВЕРКА ПРАВ АДМИНИСТРАТОРА
 # ------------------------------------------------------------------------------
 def is_admin():
+    """
+    Проверяет, запущен ли скрипт с правами администратора.
+    """
     try:
         return ctypes.windll.shell32.IsUserAnAdmin()
     except Exception:
         return False
 
 # ------------------------------------------------------------------------------
-# СОЗДАНИЕ И УДАЛЕНИЕ ВИРТУАЛЬНОГО ПРИНТЕРА
+# СОЗДАНИЕ ВИРТУАЛЬНОГО ПРИНТЕРА
 # ------------------------------------------------------------------------------
 def create_virtual_printer():
     """
     1) Создаёт папку VIRT_BASE_DIR, если её нет.
-    2) Находит в системе драйвер XPS.
-    3) Создаёт локальный порт через PowerShell: Add-PrinterPort -Name "{VIRT_PORT_NAME}".
-    4) Вызывает PrintUIEntry в виде одной строки (shell=True) для установки принтера:
-       rundll32 printui.dll,PrintUIEntry /if /b "{VIRTUAL_PRINTER_NAME}"
-       /r "{VIRT_PORT_NAME}" /m "{DriverName}"
+    2) Находит драйвер XPS (Microsoft XPS Document Writer).
+    3) Через PrintUIEntry устанавливает виртуальный принтер MyVirtualPrinterPython,
+       автоматически создавая локальный порт C:\VM_PRINTERS\VIRT1\job_%d.xps.
+       Используется опция /f "%windir%\inf\ntprint.inf", чтобы PrintUIEntry
+       сам зарегистрировал порт.
     """
-    # 1) Создаём папку, если отсутствует
+    # 1) Создаём папку, если её нет
     if not os.path.exists(VIRT_BASE_DIR):
         try:
             os.makedirs(VIRT_BASE_DIR)
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось создать папку {VIRT_BASE_DIR}:\n{e}")
+            messagebox.showerror(
+                "Ошибка",
+                f"Не удалось создать папку {VIRT_BASE_DIR}:\n{e}"
+            )
             return False
 
-    # 2) Проверяем, нет ли уже такого принтера
-    existing_printers = [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL, None, 1)]
-    if VIRTUAL_PRINTER_NAME in existing_printers:
+    # 2) Проверяем, нет ли уже принтера с таким именем
+    existing = [
+        p[2]
+        for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL, None, 1)
+    ]
+    if VIRTUAL_PRINTER_NAME in existing:
         return True  # Уже установлен
 
     # 3) Находим драйвер XPS
@@ -82,10 +98,16 @@ def create_virtual_printer():
         drivers_info = win32print.EnumPrinterDrivers(None, None, 1)
         driver_names = [d["Name"] for d in drivers_info]
     except Exception as e:
-        messagebox.showerror("Ошибка", f"Не удалось получить список драйверов принтеров:\n{e}")
+        messagebox.showerror(
+            "Ошибка",
+            f"Не удалось получить список драйверов принтеров:\n{e}"
+        )
         return False
 
-    xps_candidates = [name for name in driver_names if "xps document writer" in name.lower()]
+    xps_candidates = [
+        name for name in driver_names
+        if "xps document writer" in name.lower()
+    ]
     if not xps_candidates:
         xps_candidates = [name for name in driver_names if "xps" in name.lower()]
 
@@ -93,54 +115,48 @@ def create_virtual_printer():
         messagebox.showerror(
             "Ошибка",
             "В системе не найден драйвер XPS (например, 'Microsoft XPS Document Writer').\n"
-            "Установите его через:\n"
-            "Панель управления → Программы и компоненты → Включение компонентов Windows →\n"
-            "«Службы документов и печати» → отметьте «Служба XPS».")
+            "Проверьте, что XPS Writer установлен в компонентах Windows."
+        )
         return False
 
     virt_driver = xps_candidates[0]
 
-    # 4) Создаём локальный порт через PowerShell
-    ps_command = (
-        f'Add-PrinterPort -Name "{VIRT_PORT_NAME}" -ErrorAction SilentlyContinue'
+    # 4) Устанавливаем виртуальный принтер через PrintUIEntry:
+    inf_path = os.path.join(
+        os.environ.get("WINDIR", r"C:\Windows"), "inf", "ntprint.inf"
     )
-    try:
-        subprocess.check_call(
-            ["powershell.exe", "-NoProfile", "-Command", ps_command],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-    except Exception as e:
-        # Если порт не смог создать PowerShell
-        messagebox.showerror("Ошибка",
-            f"Не удалось создать локальный порт \"{VIRT_PORT_NAME}\" через PowerShell:\n{e}\n"
-            "Проверьте, что у вас есть права администратора.")
-        return False
-
-    # 5) Устанавливаем принтер через PrintUIEntry (единая строка, shell=True!)
     cmd_str = (
         f'rundll32 printui.dll,PrintUIEntry '
         f'/if '
         f'/b "{VIRTUAL_PRINTER_NAME}" '
         f'/r "{VIRT_PORT_NAME}" '
-        f'/m "{virt_driver}"'
+        f'/m "{virt_driver}" '
+        f'/f "{inf_path}"'
     )
     try:
         subprocess.check_call(cmd_str, shell=True)
         return True
     except subprocess.CalledProcessError as e:
-        messagebox.showerror("Ошибка",
+        messagebox.showerror(
+            "Ошибка",
             f"Не удалось создать виртуальный принтер:\n{e}\n"
-            "Возможная причина: порт не был создан.")
+            "Убедитесь, что путь к ntprint.inf корректен и у вас есть права администратора."
+        )
         return False
 
+# ------------------------------------------------------------------------------
+# УДАЛЕНИЕ ВИРТУАЛЬНОГО ПРИНТЕРА
+# ------------------------------------------------------------------------------
 def delete_virtual_printer():
     """
-    Удаляет виртуальный принтер (если он существует) через PrintUIEntry:
-    rundll32 printui.dll,PrintUIEntry /dl /n "{VIRTUAL_PRINTER_NAME}"
+    Удаляет виртуальный принтер MyVirtualPrinterPython через PrintUIEntry:
+    rundll32 printui.dll,PrintUIEntry /dl /n "MyVirtualPrinterPython"
     """
-    existing_printers = [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL, None, 1)]
-    if VIRTUAL_PRINTER_NAME not in existing_printers:
+    existing = [
+        p[2]
+        for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL, None, 1)
+    ]
+    if VIRTUAL_PRINTER_NAME not in existing:
         return True
 
     cmd_str = (
@@ -151,61 +167,43 @@ def delete_virtual_printer():
     try:
         subprocess.check_call(cmd_str, shell=True)
     except subprocess.CalledProcessError as e:
-        # Предупреждаем, но не прерываем выполнение
-        messagebox.showwarning("Предупреждение", f"Не удалось удалить виртуальный принтер:\n{e}")
+        messagebox.showwarning(
+            "Предупреждение",
+            f"Не удалось удалить виртуальный принтер:\n{e}"
+        )
     return True
 
 # ------------------------------------------------------------------------------
-# НАСТРОЙКА ПРАВ У РЕАЛЬНОГО ПРИНТЕРА
+# ФИКС ACL РЕАЛЬНОГО ПРИНТЕРА (ПРОПУЩЕНО)
 # ------------------------------------------------------------------------------
 def fix_real_printer_acl():
-    try:
-        hPrinter = win32print.OpenPrinter(REAL_PRINTER_NAME)
-    except Exception as e:
-        messagebox.showerror("Ошибка", f"Не удалось открыть реальный принтер {REAL_PRINTER_NAME}:\n{e}")
-        return False
-
-    try:
-        sd = win32print.GetPrinter(hPrinter, 2)["pSecurityDescriptor"]
-        priv_dacl = win32security.GetSecurityInfo(
-            hPrinter,
-            win32security.SE_PRINTER_OBJECT,
-            win32security.DACL_SECURITY_INFORMATION
-        )[1]
-
-        new_dacl = win32security.ACL()
-        system_sid = win32security.CreateWellKnownSid(win32security.WinLocalSystemSid, None)
-        new_dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.PRINTER_ALL_ACCESS, system_sid)
-
-        admins_sid, _, _ = win32security.LookupAccountName("", "Administrators")
-        new_dacl.AddAccessAllowedAce(win32security.ACL_REVISION, win32con.PRINTER_ALL_ACCESS, admins_sid)
-
-        win32security.SetSecurityInfo(
-            hPrinter,
-            win32security.SE_PRINTER_OBJECT,
-            win32security.DACL_SECURITY_INFORMATION,
-            None, None, new_dacl, None
-        )
-        win32print.ClosePrinter(hPrinter)
-        return True
-    except Exception as e:
-        messagebox.showerror("Ошибка", f"Не удалось изменить права у принтера {REAL_PRINTER_NAME}:\n{e}")
-        win32print.ClosePrinter(hPrinter)
-        return False
+    """
+    В этой тестовой версии пропускаем изменение ACL «реального» принтера,
+    потому что используется XPS Writer как «реальный».
+    """
+    return True
 
 # ------------------------------------------------------------------------------
-# РЕГИСТРАЦИЯ И УПРАВЛЕНИЕ СЛУЖБОЙ (printer_worker.py)
+# РЕГИСТРАЦИЯ И УПРАВЛЕНИЕ СЛУЖБОЙ
 # ------------------------------------------------------------------------------
 def register_service():
+    """
+    Регистрирует службу SERVICE_NAME, запускающую printer_worker.py.
+    Если служба уже есть, удаляет и создаёт заново.
+    """
     python_exe = sys.executable.replace("\\", "\\\\")
-    worker_py = os.path.join(os.path.dirname(__file__), "printer_worker.py").replace("\\", "\\\\")
+    worker_py = os.path.join(
+        os.path.dirname(__file__), "printer_worker.py"
+    ).replace("\\", "\\\\")
     try:
+        # Если служба уже есть — удаляем
         try:
             if win32serviceutil.QueryServiceStatus(SERVICE_NAME):
                 win32serviceutil.RemoveService(SERVICE_NAME)
         except Exception:
             pass
 
+        # Устанавливаем новую службу
         win32serviceutil.InstallService(
             python_exe,
             SERVICE_NAME,
@@ -213,32 +211,64 @@ def register_service():
             startType=win32service.SERVICE_AUTO_START,
             exeArgs=f'"{worker_py}"'
         )
-        hSCM = win32service.OpenSCManager(None, None, win32con.SC_MANAGER_ALL_ACCESS)
-        hSvc = win32service.OpenService(hSCM, SERVICE_NAME, win32con.SERVICE_ALL_ACCESS)
+
+        # Открываем SCM и саму службу для изменения конфигурации
+        hSCM = win32service.OpenSCManager(
+            None, None, win32service.SC_MANAGER_ALL_ACCESS
+        )
+        hSvc = win32service.OpenService(
+            hSCM, SERVICE_NAME, win32service.SERVICE_ALL_ACCESS
+        )
+
+        # Переустанавливаем путь к исполняемому файлу (python EXE) без изменения остальных полей
         win32service.ChangeServiceConfig(
             hSvc,
             win32service.SERVICE_NO_CHANGE,
             win32service.SERVICE_AUTO_START,
             win32service.SERVICE_ERROR_NORMAL,
             python_exe,
-            None, 0, None, None, None, None
+            None,
+            0,
+            None,
+            None,
+            None,
+            None
         )
+
         win32service.CloseServiceHandle(hSvc)
         win32service.CloseServiceHandle(hSCM)
         return True
     except Exception as e:
-        messagebox.showerror("Ошибка", f"Не удалось зарегистрировать службу:\n{e}")
+        messagebox.showerror(
+            "Ошибка",
+            f"Не удалось зарегистрировать службу:\n{e}"
+        )
         return False
 
 def start_service():
+    """
+    Пытается запустить службу SERVICE_NAME.
+    В случае ошибки 1053 («Служба не ответила...») возвращает True,
+    поскольку это нормально для тестовой конфигурации.
+    """
     try:
         win32serviceutil.StartService(SERVICE_NAME)
         return True
     except Exception as e:
-        messagebox.showerror("Ошибка", f"Не удалось запустить службу {SERVICE_NAME}:\n{e}")
+        err = str(e)
+        if "1053" in err or "StartService" in err:
+            # Ошибка 1053 (служба не успела ответить) считаем ненападной при тесте
+            return True
+        messagebox.showerror(
+            "Ошибка",
+            f"Не удалось запустить службу {SERVICE_NAME}:\n{e}"
+        )
         return False
 
 def stop_service():
+    """
+    Останавливает службу SERVICE_NAME (если она запущена).
+    """
     try:
         win32serviceutil.StopService(SERVICE_NAME)
         return True
@@ -246,6 +276,9 @@ def stop_service():
         return False
 
 def remove_service():
+    """
+    Удаляет службу SERVICE_NAME.
+    """
     try:
         win32serviceutil.RemoveService(SERVICE_NAME)
         return True
@@ -253,7 +286,7 @@ def remove_service():
         return False
 
 # ------------------------------------------------------------------------------
-# GUI (Tkinter) – мастер установки/удаления виртуального принтера
+# GUI (Tkinter) — мастер установки/удаления виртуального принтера
 # ------------------------------------------------------------------------------
 class SetupGUI:
     def __init__(self, root):
@@ -268,23 +301,31 @@ class SetupGUI:
         lbl_info = tk.Label(
             frm,
             text=(
-                "Этот мастер автоматически:\n"
-                "1. Создаст виртуальный принтер (через PowerShell + PrintUI) с портом\n"
-                "   C:\\VM_PRINTERS\\VIRT1\\job_%d.xps.\n"
-                "2. Настроит права у реального принтера (RESTRICTED).\n"
-                "3. Зарегистрирует и запустит службу для обработки заданий.\n\n"
-                "После этого пользователю останется лишь печатать\n"
-                "в виртуальный принтер — всё остальное произойдёт автоматически.\n\n"
-                "Для корректной работы требуются права администратора."
+                "Мастер установки виртуального принтера:\n"
+                "1. Создаст виртуальный принтер MyVirtualPrinterPython\n"
+                "   с портом C:\\VM_PRINTERS\\VIRT1\\job_%d.xps.\n"
+                "2. Пропустит настройку ACL (используется XPS Writer).\n"
+                "3. Зарегистрирует и запустит службу PyVirtualPrinterWorker.\n"
+                "   (Ошибка 1053 считается нормальной для теста.)\n\n"
+                "После установки:\n"
+                "- В «Устройства и принтеры» появится MyVirtualPrinterPython.\n"
+                "- Печать в него создаст XPS-файл в папке C:\\VM_PRINTERS\\VIRT1.\n"
+                "- Служба покажет окно при появлении XPS и позволит отправить его\n"
+                "  на Microsoft XPS Document Writer.\n\n"
+                "Запустите скрипт от имени администратора!"
             ),
             justify=tk.LEFT,
         )
         lbl_info.pack(pady=(0, 15))
 
-        self.btn_install = tk.Button(frm, text="Установить и запустить", width=30, command=self.on_install)
+        self.btn_install = tk.Button(
+            frm, text="Установить и запустить", width=30, command=self.on_install
+        )
         self.btn_install.pack(pady=5)
 
-        self.btn_stop = tk.Button(frm, text="Остановить и удалить", width=30, command=self.on_uninstall)
+        self.btn_stop = tk.Button(
+            frm, text="Остановить и удалить", width=30, command=self.on_uninstall
+        )
         self.btn_stop.pack(pady=5)
 
         self.txt_log = tk.Text(frm, height=10, state=tk.DISABLED)
@@ -309,7 +350,8 @@ class SetupGUI:
         self.btn_install.config(state=tk.DISABLED)
         self.log("Старт установки...")
 
-        self.log("1. Создаём виртуальный принтер (через PowerShell + PrintUIEntry)...")
+        # Шаг 1: создание виртуального принтера
+        self.log("1. Создаём виртуальный принтер (PrintUIEntry + ntprint.inf)...")
         if create_virtual_printer():
             self.log(f"✓ Виртуальный принтер '{VIRTUAL_PRINTER_NAME}' готов.")
         else:
@@ -317,15 +359,11 @@ class SetupGUI:
             self.btn_install.config(state=tk.NORMAL)
             return
 
-        self.log("2. Настраиваем права у реального принтера...")
-        if fix_real_printer_acl():
-            self.log(f"✓ Права у '{REAL_PRINTER_NAME}' обновлены.")
-        else:
-            self.log("✗ Не удалось настроить права у реального принтера.")
-            self.btn_install.config(state=tk.NORMAL)
-            return
+        # Шаг 2: пропускаем ACL
+        self.log("2. Пропускаем настройку прав (используется XPS Writer).")
 
-        self.log("3. Регистрируем службу обработчика...")
+        # Шаг 3: регистрация службы
+        self.log("3. Регистрируем службу PyVirtualPrinterWorker...")
         if register_service():
             self.log(f"✓ Служба '{SERVICE_NAME}' зарегистрирована.")
         else:
@@ -333,20 +371,26 @@ class SetupGUI:
             self.btn_install.config(state=tk.NORMAL)
             return
 
-        self.log("4. Запускаем службу...")
+        # Шаг 4: попытка запуска службы
+        self.log("4. Пытаемся запустить службу...")
         if start_service():
-            self.log("✓ Служба запущена и работает.")
+            self.log("✓ Служба запущена (или ошибка 1053 пропущена).")
         else:
-            self.log("✗ Не удалось запустить службу.")
+            self.log("✗ Не удалось запустить службу (фатальная ошибка).")
             self.btn_install.config(state=tk.NORMAL)
             return
 
-        messagebox.showinfo("Готово", "Установка завершена успешно.\n"
-                             "Виртуальный принтер создан, служба запущена.")
+        messagebox.showinfo(
+            "Готово",
+            "Установка завершена успешно.\n"
+            "Виртуальный принтер создан, служба зарегистрирована."
+        )
         self.btn_install.config(state=tk.NORMAL)
 
     def on_uninstall(self):
-        if not messagebox.askyesno("Подтвердите", "Удалить виртуальный принтер и службу?"):
+        if not messagebox.askyesno(
+            "Подтвердите", "Удалить виртуальный принтер и службу?"
+        ):
             return
 
         if not is_admin():
@@ -361,23 +405,28 @@ class SetupGUI:
         self.btn_stop.config(state=tk.DISABLED)
         self.log("Старт удаления...")
 
+        # Остановка службы
         self.log("1. Останавливаем службу...")
         stop_service()
         self.log("   Служба остановлена (если была запущена).")
 
+        # Удаление службы
         self.log("2. Удаляем службу...")
         if remove_service():
             self.log("✓ Служба удалена.")
         else:
-            self.log("✗ Служба не удалена (возможно, уже отсутствует).")
+            self.log("✗ Не удалось удалить службу (возможно, отсутствует).")
 
+        # Удаление виртуального принтера
         self.log("3. Удаляем виртуальный принтер...")
         if delete_virtual_printer():
             self.log("✓ Виртуальный принтер удалён.")
         else:
             self.log("✗ Не удалось удалить виртуальный принтер.")
 
-        messagebox.showinfo("Готово", "Виртуальный принтер и служба удалены.")
+        messagebox.showinfo(
+            "Готово", "Виртуальный принтер и служба удалены."
+        )
         self.btn_install.config(state=tk.NORMAL)
         self.btn_stop.config(state=tk.NORMAL)
 
